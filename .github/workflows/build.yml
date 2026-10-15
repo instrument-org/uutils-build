@@ -1,0 +1,129 @@
+# Builds uutils coreutils, findutils, diffutils and grep at the versions in
+# versions.env, with the patches under patches/<repo>/ applied, for every
+# platform Instrument ships, and smoke-tests each build. Pushing a tag also
+# publishes the archives, their checksums and SHA256SUMS as a release.
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest, core: "feat_Tier1,feat_require_unix,feat_require_unix_utmpx" }
+          - { target: x86_64-apple-darwin, os: macos-latest, core: "feat_Tier1,feat_require_unix,feat_require_unix_utmpx" }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, core: feat_os_windows }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm, core: feat_os_windows }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, core: feat_os_unix_musl }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, core: feat_os_unix_musl }
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: build
+      - name: toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+          rustc --version
+      - name: musl C compiler
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+          t=${{ matrix.target }}
+          echo "CC_${t//-/_}=musl-gcc" >> "$GITHUB_ENV"
+      - name: build
+        run: |
+          set -euo pipefail
+          source build/versions.env
+          T=${{ matrix.target }}
+          EXE=""; [[ $T == *windows* ]] && EXE=.exe
+          mkdir -p out timings
+          build() { # repo tag features bins...
+            local repo=$1 tag=$2 features=$3; shift 3
+            git clone -q --depth 1 --branch "$tag" "https://github.com/uutils/$repo.git" "src-$repo"
+            for p in build/patches/$repo/*.patch; do
+              [ -e "$p" ] || continue
+              git -C "src-$repo" apply --verbose "../$p"
+            done
+            local start=$SECONDS
+            (cd "src-$repo" && cargo build --release --locked --target "$T" ${features:+--features "$features"} $(printf -- '--bin %s ' "$@"))
+            echo "$repo $tag $((SECONDS - start))s" | tee -a timings/build.txt
+            for b in "$@"; do cp "src-$repo/target/$T/release/$b$EXE" out/; done
+            mkdir -p "out/licenses/$repo" && cp "src-$repo"/LICENSE* "out/licenses/$repo/"
+          }
+          build coreutils "$COREUTILS" "${{ matrix.core }}" coreutils
+          build findutils "$FINDUTILS" "" find xargs
+          build diffutils "$DIFFUTILS" "" diffutils
+          build grep "$GREP" "" grep
+          ls -la out
+      - name: smoke test
+        run: |
+          set -euo pipefail
+          cd out
+          EXE=""; [[ ${{ matrix.target }} == *windows* ]] && EXE=.exe
+          ./coreutils$EXE sort --version | head -1
+          ./find$EXE --version | head -1
+          ./grep$EXE --version | head -1
+          ./diffutils$EXE cmp ./coreutils$EXE ./coreutils$EXE && echo "cmp ok"
+          mkdir -p t/a/b && echo hit > t/a/b/c.txt
+          # Git Bash would rewrite a bare `/` value into its install folder.
+          export MSYS2_ENV_CONV_EXCL=UUTILS_PATH_SEPARATOR
+          for v in / slash; do
+            UUTILS_PATH_SEPARATOR=$v ./find$EXE t -name c.txt
+            UUTILS_PATH_SEPARATOR=$v ./grep$EXE -r hit t
+            test "$(UUTILS_PATH_SEPARATOR=$v ./find$EXE t -name c.txt)" = "t/a/b/c.txt"
+            test "$(UUTILS_PATH_SEPARATOR=$v ./grep$EXE -rl hit t)" = "t/a/b/c.txt"
+          done
+          rm -rf t
+      - name: package
+        run: |
+          set -euo pipefail
+          T=${{ matrix.target }}
+          NAME=uutils-$T
+          cd out
+          if [[ $T == *windows* ]]; then 7z a -bd -tzip "../$NAME.zip" . >/dev/null; F=$NAME.zip; else tar -czf "../$NAME.tar.gz" .; F=$NAME.tar.gz; fi
+          cd ..
+          if command -v sha256sum >/dev/null; then sha256sum "$F" > "$F.sha256"; else shasum -a 256 "$F" > "$F.sha256"; fi
+          du -k out/* out/licenses/* "$F" | tee -a timings/build.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uutils-${{ matrix.target }}
+          path: |
+            uutils-${{ matrix.target }}.*
+            timings/build.txt
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          cat uutils-*.sha256 | sed 's/ \*/  /' > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --notes "Built from the versions in versions.env at this tag, with the patches under patches/ applied. SHA256SUMS lists every archive." \
+            uutils-*.zip uutils-*.tar.gz uutils-*.sha256 SHA256SUMS
